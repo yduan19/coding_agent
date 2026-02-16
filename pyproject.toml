@@ -1,0 +1,20 @@
+[project]
+name = "liteagent"
+version = "0.1.0"
+description = "Lightweight learning-focused coding agent with OpenAI default and optional Anthropic support"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "openai>=1.40.0",
+  "anthropic>=0.43.0",
+]
+
+[project.scripts]
+liteagent = "liteagent.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["liteagent"]
