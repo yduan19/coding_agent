@@ -16,6 +16,9 @@ pip install -e .
 # Default provider: OpenAI
 export OPENAI_API_KEY="your_openai_key"
 
+# Optional provider: Azure OpenAI
+export AZURE_OPENAI_API_KEY="your_azure_openai_key"
+
 # Optional provider: Anthropic Claude
 export ANTHROPIC_API_KEY="your_anthropic_key"
 ```
@@ -48,8 +51,15 @@ liteagent run "refactor parser to use dataclass"
 # OpenAI (default)
 liteagent --provider openai --model gpt-5.2
 
+# Azure OpenAI
+# NOTE: --model is your *deployment name* in Azure.
+liteagent --provider azure_openai \
+  --base-url "https://<resource>.openai.azure.com/" \
+  --azure-api-version "2024-02-15-preview" \
+  --model "<deployment_name>"
+
 # Anthropic
-liteagent --provider anthropic --model claude-sonnet-4-5-20250929
+liteagent --provider anthropic --model claude-sonnet-4-20250929
 ```
 
 ### Streaming
@@ -67,14 +77,15 @@ liteagent run "add type hints" --no-stream
 
 ### Common flags
 
-- `--provider`: `openai` (default) or `anthropic`
-- `--model`: model id for the selected provider
+- `--provider`: `openai` (default), `azure_openai`, or `anthropic`
+- `--model`: model id for the selected provider (Azure: deployment name)
 - `--root`: project root (default `.`)
 - `--max-steps`: max tool-call rounds per turn (default `20`)
 - `--patch-out`: patch output file (default `.liteagent/last.patch`)
 - `--open-diff`: open side-by-side VS Code diffs after changes
 - `--api-key`: override env key for selected provider
-- `--base-url`: provider-compatible API base URL override
+- `--base-url`: provider-compatible API base URL override (Azure: endpoint)
+- `--azure-api-version`: Azure OpenAI api-version (provider `azure_openai` only)
 
 ## How It Works
 
@@ -139,9 +150,11 @@ Implications:
 ### Provider behavior
 
 - OpenAI path uses Chat Completions with function tools.
+- Azure OpenAI path uses the OpenAI Python SDK `AzureOpenAI` client (Chat Completions).
 - Anthropic path uses Messages API with `tool_use` / `tool_result` blocks.
 - If selected provider key is missing, startup fails with a clear message:
   - `OPENAI_API_KEY` for `openai`
+  - `AZURE_OPENAI_API_KEY` for `azure_openai`
   - `ANTHROPIC_API_KEY` for `anthropic`
 - If Anthropic model is invalid, liteagent returns a friendly error and tries to list
   available model ids.

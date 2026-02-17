@@ -3,6 +3,10 @@
 The agent sends user instructions to either OpenAI (default) or Anthropic,
 allows the model to call local tools, and stops when the model returns a
 plain-text response.
+
+Azure OpenAI support:
+- Provider id: `azure_openai`
+- Uses the OpenAI Python SDK in "AzureOpenAI" mode.
 """
 
 from __future__ import annotations
@@ -35,7 +39,7 @@ class AgentResult:
 
 
 class CodingAgent:
-    """Minimal coding agent with OpenAI and Anthropic provider support."""
+    """Minimal coding agent with OpenAI, Azure OpenAI, and Anthropic provider support."""
 
     def __init__(
         self,
@@ -44,19 +48,27 @@ class CodingAgent:
         provider: str = "openai",
         api_key: str | None = None,
         base_url: str | None = None,
+        azure_api_version: str | None = None,
     ) -> None:
         """Create an agent bound to a project root.
 
         Args:
             root: Repository directory where tools can read/write.
             model: Provider model name.
-            provider: `openai` (default) or `anthropic`.
+                - openai: model id (e.g. "gpt-4.1-mini")
+                - azure_openai: deployment name
+                - anthropic: model id
+            provider: `openai` (default), `azure_openai`, or `anthropic`.
             api_key: Optional API key override. Falls back to environment.
-            base_url: Optional provider-compatible API base URL.
+            base_url:
+                - openai: optional OpenAI-compatible base URL
+                - azure_openai: Azure endpoint base URL, e.g. https://<resource>.openai.azure.com/
+                - anthropic: optional base URL
+            azure_api_version: Azure OpenAI API version (only used for azure_openai).
         """
         provider = provider.lower()
-        if provider not in {"openai", "anthropic"}:
-            raise ValueError("provider must be 'openai' or 'anthropic'")
+        if provider not in {"openai", "azure_openai", "anthropic"}:
+            raise ValueError("provider must be 'openai', 'azure_openai', or 'anthropic'")
 
         self.root = root.resolve()
         self.model = model
@@ -73,6 +85,28 @@ class CodingAgent:
                     "openai package is required. Install dependencies with `pip install -e .`."
                 ) from exc
             self.client = OpenAI(api_key=api_key, base_url=base_url)
+            return
+
+        if provider == "azure_openai":
+            try:
+                from openai import AzureOpenAI
+            except ModuleNotFoundError as exc:
+                raise RuntimeError(
+                    "openai package is required. Install dependencies with `pip install -e .`."
+                ) from exc
+
+            if not base_url:
+                raise ValueError(
+                    "azure_openai provider requires --base-url set to your Azure endpoint, "
+                    "e.g. https://<resource>.openai.azure.com/"
+                )
+
+            # Note: in Azure mode, `model` should be your deployment name.
+            self.client = AzureOpenAI(
+                api_key=api_key,
+                azure_endpoint=base_url,
+                api_version=azure_api_version or "2024-02-15-preview",
+            )
             return
 
         try:
@@ -109,7 +143,7 @@ class CodingAgent:
         on_text_delta: Callable[[str], None] | None = None,
     ) -> AgentResult:
         """Execute one instruction with iterative tool calling."""
-        if self.provider == "openai":
+        if self.provider in {"openai", "azure_openai"}:
             return self._run_turn_openai(
                 instruction=instruction,
                 max_steps=max_steps,

@@ -4,6 +4,14 @@ Examples:
     liteagent
     liteagent chat --provider anthropic
     liteagent run "Add unit tests for parser module" --open-diff
+
+Azure OpenAI example:
+    export AZURE_OPENAI_API_KEY="..."
+    liteagent run "hello" \
+      --provider azure_openai \
+      --base-url "https://<resource>.openai.azure.com/" \
+      --azure-api-version "2024-02-15-preview" \
+      --model "<deployment_name>"
 """
 
 from __future__ import annotations
@@ -18,10 +26,16 @@ from .agent import CodingAgent
 DEFAULT_PROVIDER = "openai"
 DEFAULT_MODELS = {
     "openai": "gpt-4.1-mini",
+    "azure_openai": "gpt-4.1-mini",  # interpreted as deployment name
     "anthropic": "claude-sonnet-4-20250514",
 }
 MODEL_CHOICES = {
     "openai": [
+        "gpt-4.1-mini",
+        "gpt-4.1",
+        "gpt-4o-mini",
+    ],
+    "azure_openai": [
         "gpt-4.1-mini",
         "gpt-4.1",
         "gpt-4o-mini",
@@ -41,7 +55,7 @@ def _add_common_options(cmd: argparse.ArgumentParser) -> None:
     cmd.add_argument(
         "--provider",
         default=DEFAULT_PROVIDER,
-        choices=["openai", "anthropic"],
+        choices=["openai", "azure_openai", "anthropic"],
         help="LLM provider.",
     )
     cmd.add_argument("--model", default=None, help="Model name for selected provider.")
@@ -49,7 +63,15 @@ def _add_common_options(cmd: argparse.ArgumentParser) -> None:
     cmd.add_argument(
         "--base-url",
         default=None,
-        help="Optional provider-compatible API base URL.",
+        help=(
+            "Optional provider-compatible API base URL. "
+            "For azure_openai, this must be your Azure endpoint like https://<resource>.openai.azure.com/"
+        ),
+    )
+    cmd.add_argument(
+        "--azure-api-version",
+        default=None,
+        help="Azure OpenAI api-version (only used when --provider azure_openai).",
     )
     cmd.add_argument("--max-steps", type=int, default=20, help="Maximum tool-call rounds.")
     cmd.add_argument(
@@ -74,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Create CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="liteagent",
-        description="Lightweight Python coding agent using OpenAI by default, with optional Anthropic Claude support.",
+        description="Lightweight Python coding agent using OpenAI by default, with optional Anthropic Claude and Azure OpenAI support.",
     )
     sub = parser.add_subparsers(dest="command", required=False)
 
@@ -92,6 +114,7 @@ def _load_api_keys() -> dict[str, str | None]:
     """Load provider API keys from system environment."""
     return {
         "openai": os.getenv("OPENAI_API_KEY"),
+        "azure_openai": os.getenv("AZURE_OPENAI_API_KEY"),
         "anthropic": os.getenv("ANTHROPIC_API_KEY"),
     }
 
@@ -101,7 +124,12 @@ def _resolve_api_key(provider: str, explicit_api_key: str | None, env_keys: dict
     if explicit_api_key:
         return explicit_api_key
 
-    env_key_name = "OPENAI_API_KEY" if provider == "openai" else "ANTHROPIC_API_KEY"
+    env_key_name = {
+        "openai": "OPENAI_API_KEY",
+        "azure_openai": "AZURE_OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+    }[provider]
+
     key = env_keys.get(provider)
     if key:
         return key
@@ -160,6 +188,7 @@ def _create_agent(
         provider=provider,
         api_key=api_key,
         base_url=args.base_url,
+        azure_api_version=getattr(args, "azure_api_version", None),
     )
 
 
@@ -179,7 +208,7 @@ def _run_once(args: argparse.Namespace, env_keys: dict[str, str | None]) -> None
     """Handle one-shot execution mode."""
     agent = _create_agent(args, interactive_select_model=False, env_keys=env_keys)
     if args.stream and agent.provider == "anthropic":
-        print("Streaming is currently supported for OpenAI provider; Anthropic uses buffered output.")
+        print("Streaming is currently supported for OpenAI/Azure OpenAI provider; Anthropic uses buffered output.")
     if args.stream:
         print("\nagent> ", end="", flush=True)
     try:
@@ -216,7 +245,7 @@ def _chat_loop(args: argparse.Namespace, env_keys: dict[str, str | None]) -> Non
     print(f"Provider: {agent.provider}")
     print(f"Model: {agent.model}")
     if args.stream and agent.provider == "anthropic":
-        print("Streaming is currently supported for OpenAI provider; Anthropic uses buffered output.")
+        print("Streaming is currently supported for OpenAI/Azure OpenAI provider; Anthropic uses buffered output.")
     print("Type /exit to quit. Type /diff to open current VS Code diffs.\n")
 
     while True:
