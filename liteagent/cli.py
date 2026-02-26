@@ -19,7 +19,9 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import shlex
 import sys
+import json
 
 from .agent import CodingAgent
 
@@ -89,6 +91,17 @@ def _add_common_options(cmd: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Stream assistant text output live while generating.",
+    )
+    cmd.add_argument(
+        "--auto-verify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Automatically run a lightweight verification command after file changes.",
+    )
+    cmd.add_argument(
+        "--verify-command",
+        default=None,
+        help="Override automatic verification command (runs in project root).",
     )
 
 
@@ -192,6 +205,51 @@ def _create_agent(
     )
 
 
+
+
+def _verification_command(changed_files: list[str], explicit: str | None) -> str | None:
+    """Return a lightweight verification command based on changed files."""
+    if explicit:
+        return explicit
+
+    py_changed = [f for f in changed_files if f.endswith(".py")]
+    if py_changed:
+        quoted = " ".join(shlex.quote(f) for f in py_changed)
+        return f"python -m py_compile {quoted}"
+
+    return None
+
+
+def _run_auto_verify(agent: CodingAgent, changed_files: list[str], args: argparse.Namespace) -> None:
+    """Run best-effort post-change verification and print outcome."""
+    if not args.auto_verify or not changed_files:
+        return
+
+    command = _verification_command(changed_files=changed_files, explicit=args.verify_command)
+    if not command:
+        print("No automatic verification command inferred for changed files.")
+        return
+
+    print("\n=== Verification ===")
+    print(f"$ {command}")
+    result_json = agent.tools.run("run_shell", json.dumps({"command": command, "timeout_seconds": 120}))
+    result = json.loads(result_json)
+    if not result.get("ok"):
+        print(f"Verification failed to run: {result.get('error')}")
+        return
+
+    payload = result.get("result", {})
+    if payload.get("stdout"):
+        print(payload["stdout"].rstrip())
+    if payload.get("stderr"):
+        print(payload["stderr"].rstrip())
+
+    exit_code = payload.get("exit_code", 1)
+    if exit_code == 0:
+        print("Verification passed.")
+    else:
+        print(f"Verification failed with exit code {exit_code}.")
+
 def _finalize_turn(agent: CodingAgent, patch_out: str, open_diff: bool) -> None:
     """Write patch and optionally open visual diffs."""
     patch_path = agent.changes.write_patch(Path(patch_out))
@@ -233,6 +291,7 @@ def _run_once(args: argparse.Namespace, env_keys: dict[str, str | None]) -> None
     else:
         print("(none)")
 
+    _run_auto_verify(agent, changed_files=result.changed_files, args=args)
     _finalize_turn(agent, patch_out=args.patch_out, open_diff=args.open_diff)
 
 
@@ -246,7 +305,7 @@ def _chat_loop(args: argparse.Namespace, env_keys: dict[str, str | None]) -> Non
     print(f"Model: {agent.model}")
     if args.stream and agent.provider == "anthropic":
         print("Streaming is currently supported for OpenAI/Azure OpenAI provider; Anthropic uses buffered output.")
-    print("Type /exit to quit. Type /diff to open current VS Code diffs.\n")
+    print("Type /exit to quit. Type /diff to open current VS Code diffs. Type /revert to undo last turn changes.\n")
 
     while True:
         try:
@@ -265,6 +324,17 @@ def _chat_loop(args: argparse.Namespace, env_keys: dict[str, str | None]) -> Non
         if instruction == "/diff":
             ok, message = agent.changes.open_vscode_diffs()
             print(message)
+            continue
+
+        if instruction == "/revert":
+            reverted = agent.revert_last_turn()
+            if not reverted:
+                print("No recent turn changes to revert.")
+                continue
+            print("Reverted files from latest turn:")
+            for rel in reverted:
+                print(f"- {rel}")
+            _finalize_turn(agent, patch_out=args.patch_out, open_diff=args.open_diff)
             continue
 
         if args.stream:
@@ -289,6 +359,7 @@ def _chat_loop(args: argparse.Namespace, env_keys: dict[str, str | None]) -> Non
             print("Changed files:")
             for fpath in changed:
                 print(f"- {fpath}")
+            _run_auto_verify(agent, changed_files=changed, args=args)
             _finalize_turn(agent, patch_out=args.patch_out, open_diff=args.open_diff)
         else:
             print("No file changes.")

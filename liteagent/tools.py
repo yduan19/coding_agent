@@ -6,9 +6,11 @@ Each tool is intentionally small and explicit to keep behavior auditable.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import fnmatch
+import hashlib
 import json
+import shutil
 import os
 from pathlib import Path
 import subprocess
@@ -83,6 +85,27 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "read_file_chunk",
+        "description": "Read a line range from a UTF-8 text file for efficient large-file inspection.",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "start_line": {
+                    "type": "integer",
+                    "description": "1-indexed start line.",
+                    "default": 1,
+                },
+                "max_lines": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to return.",
+                    "default": 200,
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
         "name": "write_file",
         "description": "Write full content to a project file.",
         "schema": {
@@ -129,6 +152,95 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "delete_path",
+        "description": "Delete a file or directory under project root.",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Required for deleting non-empty directories.",
+                    "default": False,
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "move_path",
+        "description": "Move or rename a file/directory within project root.",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "src": {"type": "string"},
+                "dst": {"type": "string"},
+            },
+            "required": ["src", "dst"],
+        },
+    },
+    {
+        "name": "copy_path",
+        "description": "Copy a file/directory within project root.",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "src": {"type": "string"},
+                "dst": {"type": "string"},
+            },
+            "required": ["src", "dst"],
+        },
+    },
+    {
+        "name": "compute_file_hash",
+        "description": "Compute a file hash to verify exact content state.",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "algorithm": {
+                    "type": "string",
+                    "description": "Hash algorithm name such as sha256, sha1, md5.",
+                    "default": "sha256",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "update_plan",
+        "description": "Update task plan status with optional explanation.",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "explanation": {"type": "string"},
+                "plan": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {"type": "string"},
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                            },
+                        },
+                        "required": ["step", "status"],
+                    },
+                },
+            },
+            "required": ["plan"],
+        },
+    },
+    {
+        "name": "get_plan",
+        "description": "Read the current in-memory task plan.",
+        "schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
         "name": "run_shell",
         "description": "Run a non-interactive shell command in project root for validation.",
         "schema": {
@@ -149,6 +261,9 @@ class ToolContext:
 
     root: Path
     changes: ChangeTracker
+    plan: dict[str, Any] | None = None
+    current_turn_undo: dict[str, str | None] = field(default_factory=dict)
+    undo_history: list[dict[str, str | None]] = field(default_factory=list)
 
 
 class ToolRunner:
@@ -156,6 +271,47 @@ class ToolRunner:
 
     def __init__(self, ctx: ToolContext) -> None:
         self.ctx = ctx
+
+
+    def begin_turn(self) -> None:
+        """Start collecting undo information for a new turn."""
+        self.ctx.current_turn_undo = {}
+
+    def commit_turn(self) -> None:
+        """Persist undo data for the last completed turn if there were file mutations."""
+        if self.ctx.current_turn_undo:
+            self.ctx.undo_history.append(dict(self.ctx.current_turn_undo))
+        self.ctx.current_turn_undo = {}
+
+    def _record_undo(self, abs_path: Path) -> None:
+        """Record pre-change file content once per path for current turn."""
+        rel = abs_path.relative_to(self.ctx.root.resolve()).as_posix()
+        if rel in self.ctx.current_turn_undo:
+            return
+        if abs_path.exists() and abs_path.is_file():
+            self.ctx.current_turn_undo[rel] = abs_path.read_text(encoding="utf-8")
+        else:
+            self.ctx.current_turn_undo[rel] = None
+
+    def revert_last_turn(self) -> list[str]:
+        """Revert file mutations from the most recent committed turn."""
+        if not self.ctx.undo_history:
+            return []
+
+        snapshot = self.ctx.undo_history.pop()
+        reverted = sorted(snapshot.keys())
+        for rel_str, before in snapshot.items():
+            abs_path = (self.ctx.root / rel_str).resolve()
+            if before is None:
+                if abs_path.exists():
+                    if abs_path.is_dir():
+                        shutil.rmtree(abs_path)
+                    else:
+                        abs_path.unlink()
+            else:
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+                abs_path.write_text(before, encoding="utf-8")
+        return reverted
 
     @staticmethod
     def tool_schemas(provider: str) -> list[dict[str, Any]]:
@@ -194,10 +350,17 @@ class ToolRunner:
             "list_files": self.list_files,
             "search_text": self.search_text,
             "read_file": self.read_file,
+            "read_file_chunk": self.read_file_chunk,
             "write_file": self.write_file,
             "append_file": self.append_file,
             "make_dir": self.make_dir,
             "file_exists": self.file_exists,
+            "delete_path": self.delete_path,
+            "move_path": self.move_path,
+            "copy_path": self.copy_path,
+            "compute_file_hash": self.compute_file_hash,
+            "update_plan": self.update_plan,
+            "get_plan": self.get_plan,
             "run_shell": self.run_shell,
         }
         if name not in handlers:
@@ -296,8 +459,31 @@ class ToolRunner:
         _, abs_path = self._resolve_path(path)
 
         rel_norm = abs_path.relative_to(self.ctx.root.resolve())
+        self._record_undo(abs_path)
         self.ctx.changes.write_file(rel_norm, content)
         return f"Wrote {rel_norm.as_posix()} ({len(content)} chars)"
+
+    def read_file_chunk(self, path: str, start_line: int = 1, max_lines: int = 200) -> dict[str, Any]:
+        """Read a chunk of a text file by line range."""
+        if start_line < 1:
+            raise ValueError("start_line must be >= 1")
+        if max_lines < 1:
+            raise ValueError("max_lines must be >= 1")
+
+        _, abs_path = self._resolve_path(path)
+        text = abs_path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        start_idx = start_line - 1
+        end_idx = min(start_idx + max_lines, len(lines))
+        chunk_lines = lines[start_idx:end_idx]
+
+        return {
+            "path": path,
+            "start_line": start_line,
+            "end_line": end_idx,
+            "total_lines": len(lines),
+            "content": "\n".join(chunk_lines),
+        }
 
     def append_file(self, path: str, content: str) -> str:
         """Append content to a file while preserving change tracking."""
@@ -320,6 +506,92 @@ class ToolRunner:
             "is_file": abs_path.is_file(),
             "is_dir": abs_path.is_dir(),
         }
+
+    def delete_path(self, path: str, recursive: bool = False) -> str:
+        """Delete a file or directory in project root."""
+        _, abs_path = self._resolve_path(path)
+        if not abs_path.exists():
+            return f"Path not found: {path}"
+
+        if abs_path.is_file() or abs_path.is_symlink():
+            rel_norm = abs_path.relative_to(self.ctx.root.resolve())
+            self.ctx.changes.record_original(rel_norm)
+            self._record_undo(abs_path)
+            abs_path.unlink()
+            return f"Deleted file {path}"
+
+        if not recursive and any(abs_path.iterdir()):
+            raise ValueError("Directory is not empty; set recursive=true to delete.")
+
+        for child in abs_path.rglob("*"):
+            if child.is_file() or child.is_symlink():
+                rel_norm = child.relative_to(self.ctx.root.resolve())
+                self.ctx.changes.record_original(rel_norm)
+                self._record_undo(child)
+
+        abs_path.rmdir() if not recursive else shutil.rmtree(abs_path)
+        return f"Deleted directory {path}"
+
+    def move_path(self, src: str, dst: str) -> str:
+        """Move/rename a file or directory in project root."""
+        _, src_abs = self._resolve_path(src)
+        _, dst_abs = self._resolve_path(dst)
+        if not src_abs.exists():
+            raise FileNotFoundError(f"Source not found: {src}")
+
+        dst_abs.parent.mkdir(parents=True, exist_ok=True)
+        self._record_undo(src_abs)
+        self._record_undo(dst_abs)
+        shutil.move(str(src_abs), str(dst_abs))
+        return f"Moved {src} -> {dst}"
+
+    def copy_path(self, src: str, dst: str) -> str:
+        """Copy a file or directory in project root."""
+        _, src_abs = self._resolve_path(src)
+        _, dst_abs = self._resolve_path(dst)
+        if not src_abs.exists():
+            raise FileNotFoundError(f"Source not found: {src}")
+
+        if dst_abs.exists():
+            raise ValueError("Destination already exists")
+        dst_abs.parent.mkdir(parents=True, exist_ok=True)
+        self._record_undo(dst_abs)
+        if src_abs.is_dir():
+            shutil.copytree(src_abs, dst_abs)
+        else:
+            shutil.copy2(src_abs, dst_abs)
+        return f"Copied {src} -> {dst}"
+
+    def compute_file_hash(self, path: str, algorithm: str = "sha256") -> dict[str, str]:
+        """Compute digest for a file using hashlib."""
+        _, abs_path = self._resolve_path(path)
+        if not abs_path.is_file():
+            raise ValueError("Path must be a file")
+
+        hasher = hashlib.new(algorithm)
+        with abs_path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(8192), b""):
+                hasher.update(chunk)
+        return {
+            "path": path,
+            "algorithm": algorithm,
+            "digest": hasher.hexdigest(),
+        }
+
+    def update_plan(self, plan: list[dict[str, str]], explanation: str = "") -> dict[str, Any]:
+        """Store/update an in-memory task plan for visibility and progress tracking."""
+        in_progress_count = sum(1 for item in plan if item.get("status") == "in_progress")
+        if in_progress_count > 1:
+            raise ValueError("At most one plan item can be in_progress")
+        self.ctx.plan = {
+            "explanation": explanation,
+            "plan": plan,
+        }
+        return self.ctx.plan
+
+    def get_plan(self) -> dict[str, Any]:
+        """Return the current plan if one has been set."""
+        return self.ctx.plan or {"explanation": "", "plan": []}
 
     def run_shell(self, command: str, timeout_seconds: int = 60) -> dict[str, Any]:
         """Execute a shell command for checks like tests or linters."""

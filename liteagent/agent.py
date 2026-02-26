@@ -25,6 +25,8 @@ Rules:
 - Inspect files before editing them.
 - Prefer minimal, correct edits.
 - Use `write_file` with complete updated file content.
+- Keep and update a short task plan with `update_plan` for multi-step work.
+- Prefer `read_file_chunk` for large files before full reads.
 - Run lightweight checks with `run_shell` when useful.
 - When complete, reply with a concise summary of what changed.
 """
@@ -131,9 +133,38 @@ class CodingAgent:
                     parts.append(text)
         return "\n".join(parts).strip()
 
+
+    def _initialize_plan(self, instruction: str) -> None:
+        """Initialize a deterministic one-step plan before model execution."""
+        self.tools.update_plan(
+            explanation="Auto-created plan for this turn.",
+            plan=[{"step": instruction.strip() or "Complete the requested task", "status": "in_progress"}],
+        )
+
+    def _complete_plan(self, status: str, summary: str | None = None) -> None:
+        """Mark current plan as completed when a turn exits."""
+        plan_state = self.tools.get_plan()
+        items = plan_state.get("plan", [])
+        if not items:
+            return
+
+        final_status = "completed" if status == "completed" else "pending"
+        updated = []
+        for item in items:
+            updated.append({"step": item.get("step", ""), "status": final_status})
+
+        explanation = plan_state.get("explanation", "")
+        if summary:
+            explanation = f"{explanation} Final status: {status}. {summary}".strip()
+        self.tools.update_plan(explanation=explanation, plan=updated)
+
     def run(self, instruction: str, max_steps: int = 20) -> AgentResult:
         """Backward-compatible alias for `run_turn`."""
         return self.run_turn(instruction=instruction, max_steps=max_steps)
+
+    def revert_last_turn(self) -> list[str]:
+        """Revert file-system mutations from the most recent completed turn."""
+        return self.tools.revert_last_turn()
 
     def run_turn(
         self,
@@ -143,14 +174,19 @@ class CodingAgent:
         on_text_delta: Callable[[str], None] | None = None,
     ) -> AgentResult:
         """Execute one instruction with iterative tool calling."""
-        if self.provider in {"openai", "azure_openai"}:
-            return self._run_turn_openai(
-                instruction=instruction,
-                max_steps=max_steps,
-                stream=stream,
-                on_text_delta=on_text_delta,
-            )
-        return self._run_turn_anthropic(instruction=instruction, max_steps=max_steps)
+        self._initialize_plan(instruction)
+        self.tools.begin_turn()
+        try:
+            if self.provider in {"openai", "azure_openai"}:
+                return self._run_turn_openai(
+                    instruction=instruction,
+                    max_steps=max_steps,
+                    stream=stream,
+                    on_text_delta=on_text_delta,
+                )
+            return self._run_turn_anthropic(instruction=instruction, max_steps=max_steps)
+        finally:
+            self.tools.commit_turn()
 
     def _run_turn_openai(
         self,
@@ -234,6 +270,7 @@ class CodingAgent:
             if not tool_calls:
                 summary = (assistant_content or "Task completed.").strip()
                 self.messages.append({"role": "assistant", "content": assistant_content})
+                self._complete_plan(status="completed", summary=summary)
                 return AgentResult(summary=summary, changed_files=self._changed_files(self.changes))
 
             self.messages.append(
@@ -258,8 +295,10 @@ class CodingAgent:
                     }
                 )
 
+        summary = "Stopped after reaching max steps. Increase --max-steps if needed."
+        self._complete_plan(status="max_steps", summary=summary)
         return AgentResult(
-            summary="Stopped after reaching max steps. Increase --max-steps if needed.",
+            summary=summary,
             changed_files=self._changed_files(self.changes),
         )
 
@@ -294,6 +333,7 @@ class CodingAgent:
             if not tool_uses:
                 summary = self._text_from_anthropic_blocks(blocks) or "Task completed."
                 self.messages.append({"role": "assistant", "content": blocks})
+                self._complete_plan(status="completed", summary=summary)
                 return AgentResult(summary=summary, changed_files=self._changed_files(self.changes))
 
             self.messages.append({"role": "assistant", "content": blocks})
@@ -314,8 +354,10 @@ class CodingAgent:
 
             self.messages.append({"role": "user", "content": tool_result_blocks})
 
+        summary = "Stopped after reaching max steps. Increase --max-steps if needed."
+        self._complete_plan(status="max_steps", summary=summary)
         return AgentResult(
-            summary="Stopped after reaching max steps. Increase --max-steps if needed.",
+            summary=summary,
             changed_files=self._changed_files(self.changes),
         )
 

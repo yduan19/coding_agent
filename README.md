@@ -37,6 +37,7 @@ liteagent
 Interactive commands:
 
 - `/diff` open current VS Code diffs
+- `/revert` revert files changed by the latest completed turn
 - `/exit` quit session
 
 ### One-shot mode
@@ -83,6 +84,8 @@ liteagent run "add type hints" --no-stream
 - `--max-steps`: max tool-call rounds per turn (default `20`)
 - `--patch-out`: patch output file (default `.liteagent/last.patch`)
 - `--open-diff`: open side-by-side VS Code diffs after changes
+- `--auto-verify` / `--no-auto-verify`: run a lightweight post-change verification command
+- `--verify-command`: custom verification command run after file changes
 - `--api-key`: override env key for selected provider
 - `--base-url`: provider-compatible API base URL override (Azure: endpoint)
 - `--azure-api-version`: Azure OpenAI api-version (provider `azure_openai` only)
@@ -98,10 +101,17 @@ liteagent run "add type hints" --no-stream
   - `list_files`
   - `search_text`
   - `read_file`
+  - `read_file_chunk`
   - `write_file`
   - `append_file`
   - `make_dir`
   - `file_exists`
+  - `delete_path`
+  - `move_path`
+  - `copy_path`
+  - `compute_file_hash`
+  - `update_plan`
+  - `get_plan`
   - `run_shell`
 - `liteagent/changes.py`: before/after tracking, unified patch generation, VS Code diff
 
@@ -124,6 +134,8 @@ The model then receives and produces context in this sequence:
 2. Assistant response is appended.
 3. If tool calls are requested, tool outputs are appended.
 4. Steps 2-3 repeat until final text response or `--max-steps` limit.
+
+Before this loop starts, liteagent now initializes a one-step in-memory plan via `update_plan` for the current instruction and marks it complete (or max-steps reached) when the turn exits.
 
 What is included in coding context:
 
